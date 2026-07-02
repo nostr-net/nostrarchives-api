@@ -118,7 +118,24 @@ async fn main() {
         tracing::warn!(error = %e, "Failed to initialize block cache, continuing anyway");
     }
 
-    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache.clone());
+    // ClickHouse analytics (optional)
+    let clickhouse = if let Some(ch_url) = &cfg.clickhouse_url {
+        let ch = Arc::new(db::clickhouse::ClickHouseAnalytics::new(ch_url));
+        match ch.init_tables().await {
+            Ok(()) => tracing::info!("clickhouse connected, tables initialized"),
+            Err(e) => {
+                tracing::error!(error = %e, "clickhouse table init failed — disabling clickhouse");
+                // Fall through: None will be used below
+            }
+        }
+        // Re-check: if init_tables succeeded, use it
+        Some(ch)
+    } else {
+        tracing::info!("clickhouse disabled (no CLICKHOUSE_URL)");
+        None
+    };
+
+    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache.clone(), clickhouse.clone());
 
     // Backfill zero-amount zaps with bolt11 parsing (one-time startup task)
     match repo.backfill_zero_amount_zaps().await {
@@ -314,9 +331,15 @@ async fn main() {
 
     // Background: refresh analytics materialized views every 30 minutes,
     // then flush the corresponding Redis caches so stale data is never served.
+    // Skipped when ClickHouse is enabled (analytics queries go directly to ClickHouse).
+    let ch_enabled = clickhouse.is_some();
     let analytics_mv_repo = repo.clone();
     let analytics_mv_cache = stats_cache.clone();
     tokio::spawn(async move {
+        if ch_enabled {
+            tracing::info!("analytics MV refresh disabled (clickhouse enabled)");
+            return;
+        }
         // Initial delay: let migrations and profile_search finish first.
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
@@ -342,9 +365,14 @@ async fn main() {
 
     // Background: compute daily analytics.
     // On startup: backfill last 30 days. Then loop: sleep until next midnight UTC, compute yesterday.
+    // Skipped when ClickHouse is enabled (daily analytics computed on-the-fly from ClickHouse).
     let analytics_repo = repo.clone();
     let analytics_cache = stats_cache.clone();
     tokio::spawn(async move {
+        if ch_enabled {
+            tracing::info!("daily analytics computation disabled (clickhouse enabled)");
+            return;
+        }
         // Backfill on startup
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         match analytics_repo.backfill_daily_analytics(30).await {
@@ -614,6 +642,7 @@ async fn main() {
         block_cache,
         admin_pubkey: cfg.admin_pubkey.clone(),
         replay_guard: auth::ReplayGuard::new(),
+        clickhouse: clickhouse.clone(),
     };
 
     // WebSocket relay (NIP-50 search endpoint)

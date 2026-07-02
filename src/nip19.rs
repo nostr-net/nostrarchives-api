@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use bech32::FromBase32;
 use serde::Serialize;
 
 /// A decoded Nostr entity.
@@ -45,8 +44,7 @@ pub fn decode(input: &str) -> Option<NostrEntity> {
     }
 
     // Try bech32 decode
-    let (hrp, data, _) = bech32::decode(trimmed).ok()?;
-    let bytes = Vec::<u8>::from_base32(&data).ok()?;
+    let (hrp, bytes) = bech32::decode(trimmed).ok()?;
 
     match hrp.as_str() {
         "npub" => {

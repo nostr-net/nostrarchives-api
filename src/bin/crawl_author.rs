@@ -94,12 +94,9 @@ fn resolve_pubkey(input: &str) -> String {
 
     // npub1… bech32
     if trimmed.starts_with("npub1") {
-        use bech32::FromBase32;
-        if let Ok((_, data, _)) = bech32::decode(trimmed) {
-            if let Ok(bytes) = Vec::<u8>::from_base32(&data) {
-                if bytes.len() == 32 {
-                    return hex::encode(bytes);
-                }
+        if let Ok((_, bytes)) = bech32::decode(trimmed) {
+            if bytes.len() == 32 {
+                return hex::encode(bytes);
             }
         }
     }
@@ -308,6 +305,7 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
         follower_cache,
         wot_cache,
         block_cache,
+        None,
     );
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer =
@@ -426,6 +424,7 @@ async fn cmd_engagement(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<Str
         follower_cache,
         wot_cache,
         block_cache,
+        None,
     );
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
 

@@ -74,7 +74,7 @@ async fn main() {
         let wot_cache = WotCache::new(pool.clone(), 21, 900);
         let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
         block_cache.initialize().await.expect("failed to initialize block cache");
-        Some(EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache))
+        Some(EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache, None))
     } else {
         None
     };

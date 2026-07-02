@@ -8,11 +8,11 @@ description = "Nostr event ingestion & stats API"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono"] }
-redis = { version = "0.27", features = ["tokio-comp"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+redis = { version = "1", features = ["tokio-comp"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bech32 = "0.9"
+bech32 = "0.11"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -22,13 +22,14 @@ futures-util = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 negentropy = "0.5"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
 regex = "1.10"
-secp256k1 = { version = "0.29", features = ["global-context"] }
+secp256k1 = { version = "0.31", features = ["global-context"] }
 base64 = "0.22"
+clickhouse = { version = "0.15", features = ["inserter"] }
 
 [[bin]]
 name = "test_negentropy"
@@ -41,3 +42,7 @@ path = "src/bin/purge_non_wot.rs"
 [[bin]]
 name = "crawl_zaps"
 path = "src/bin/crawl_zaps.rs"
+
+[[bin]]
+name = "backfill_clickhouse"
+path = "src/bin/backfill_clickhouse.rs"

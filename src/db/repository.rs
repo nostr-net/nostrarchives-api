@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use sqlx::{PgPool, Row};
 
+use super::clickhouse::ClickHouseAnalytics;
+use super::clickhouse_models::*;
 use super::models::{
     DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount,
     NewUser, NostrEvent, StoredEvent,
@@ -18,6 +21,7 @@ pub struct EventRepository {
     pub follower_cache: FollowerCache,
     pub wot_cache: WotCache,
     pub block_cache: BlockCache,
+    pub clickhouse: Option<Arc<ClickHouseAnalytics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +63,14 @@ fn range_cache_ttl(range: &str) -> u64 {
 }
 
 impl EventRepository {
-    pub fn new(pool: PgPool, follower_cache: FollowerCache, wot_cache: WotCache, block_cache: BlockCache) -> Self {
-        Self { pool, follower_cache, wot_cache, block_cache }
+    pub fn new(
+        pool: PgPool,
+        follower_cache: FollowerCache,
+        wot_cache: WotCache,
+        block_cache: BlockCache,
+        clickhouse: Option<Arc<ClickHouseAnalytics>>,
+    ) -> Self {
+        Self { pool, follower_cache, wot_cache, block_cache, clickhouse }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -163,6 +173,34 @@ impl EventRepository {
         let inserted = result.rows_affected() > 0;
 
         if inserted {
+            // ClickHouse dual-write: insert event for analytics
+            if let Some(ch) = &self.clickhouse {
+                let client_name = extract_client_tag(&event.tags);
+                ch.insert_event(&ChEvent {
+                    id: event.id.clone(),
+                    pubkey: event.pubkey.clone(),
+                    created_at: event.created_at,
+                    kind: event.kind as i32,
+                    client_name,
+                })
+                .await;
+
+                // Extract and insert hashtags for kind-1 notes
+                if event.kind == 1 {
+                    let hashtags: Vec<String> = event
+                        .tags
+                        .iter()
+                        .filter(|t| t.len() >= 2 && t[0] == "t")
+                        .filter_map(|t| t.get(1).filter(|s| !s.is_empty()))
+                        .cloned()
+                        .collect();
+                    if !hashtags.is_empty() {
+                        ch.insert_hashtags(&event.id, &hashtags, event.created_at)
+                            .await;
+                    }
+                }
+            }
+
             // Only insert refs for kind-1 (notes)
             if event.kind == 1 {
                 self.insert_refs(event).await?;
@@ -201,17 +239,31 @@ impl EventRepository {
             return Ok(false);
         }
 
-        // Increment counter on target event
-        let updated = sqlx::query(
-            "UPDATE events SET repost_count = repost_count + 1 WHERE id = $1",
+        // Increment counter on target event, returning pubkey for ClickHouse
+        let updated: Option<(String,)> = sqlx::query_as(
+            "UPDATE events SET repost_count = repost_count + 1 WHERE id = $1 RETURNING pubkey",
         )
         .bind(&target_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        if updated.rows_affected() > 0 {
+        if let Some((target_pubkey,)) = updated {
             self.mark_seen(&event.id, event.kind as i16, &target_id, event.created_at)
                 .await?;
+
+            // ClickHouse dual-write: engagement event
+            if let Some(ch) = &self.clickhouse {
+                ch.insert_engagement(&ChEngagement {
+                    event_id: event.id.clone(),
+                    kind: event.kind as i16,
+                    target_id: target_id.clone(),
+                    target_pubkey,
+                    source_pubkey: event.pubkey.clone(),
+                    created_at: event.created_at,
+                })
+                .await;
+            }
+
             return Ok(true);
         }
 
@@ -240,17 +292,31 @@ impl EventRepository {
             return Ok(false);
         }
 
-        // Increment counter on target event
-        let updated = sqlx::query(
-            "UPDATE events SET reaction_count = reaction_count + 1 WHERE id = $1",
+        // Increment counter on target event, returning pubkey for ClickHouse
+        let updated: Option<(String,)> = sqlx::query_as(
+            "UPDATE events SET reaction_count = reaction_count + 1 WHERE id = $1 RETURNING pubkey",
         )
         .bind(&target_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        if updated.rows_affected() > 0 {
+        if let Some((target_pubkey,)) = updated {
             self.mark_seen(&event.id, event.kind as i16, &target_id, event.created_at)
                 .await?;
+
+            // ClickHouse dual-write: engagement event
+            if let Some(ch) = &self.clickhouse {
+                ch.insert_engagement(&ChEngagement {
+                    event_id: event.id.clone(),
+                    kind: event.kind as i16,
+                    target_id: target_id.clone(),
+                    target_pubkey,
+                    source_pubkey: event.pubkey.clone(),
+                    created_at: event.created_at,
+                })
+                .await;
+            }
+
             return Ok(true);
         }
 
@@ -405,6 +471,18 @@ impl EventRepository {
         .execute(&self.pool)
         .await?;
 
+        // ClickHouse dual-write: kind-3 event
+        if let Some(ch) = &self.clickhouse {
+            ch.insert_event(&ChEvent {
+                id: event.id.clone(),
+                pubkey: event.pubkey.clone(),
+                created_at: event.created_at,
+                kind: event.kind as i32,
+                client_name: String::new(),
+            })
+            .await;
+        }
+
         Ok(true)
     }
 
@@ -450,6 +528,22 @@ impl EventRepository {
         .bind(relay_url)
         .execute(&self.pool)
         .await?;
+
+        // ClickHouse dual-write: relay list entries
+        if let Some(ch) = &self.clickhouse {
+            let ch_rows: Vec<ChRelayList> = event
+                .tags
+                .iter()
+                .filter(|t| t.len() >= 2 && t[0] == "r")
+                .filter_map(|t| t.get(1).filter(|s| !s.is_empty()))
+                .map(|url| ChRelayList {
+                    pubkey: event.pubkey.clone(),
+                    relay_url: url.clone(),
+                    created_at: event.created_at,
+                })
+                .collect();
+            ch.insert_relay_list(&ch_rows).await;
+        }
 
         Ok(true)
     }
@@ -522,6 +616,19 @@ impl EventRepository {
         .await?;
 
         tx.commit().await?;
+
+        // ClickHouse dual-write: follow edges
+        if let Some(ch) = &self.clickhouse {
+            let ch_rows: Vec<ChFollow> = followees
+                .iter()
+                .map(|(followed, _)| ChFollow {
+                    follower_pubkey: event.pubkey.clone(),
+                    followed_pubkey: followed.clone(),
+                    created_at: event.created_at,
+                })
+                .collect();
+            ch.insert_follows(&ch_rows).await;
+        }
 
         Ok(Some(followees.len()))
     }
@@ -602,10 +709,28 @@ impl EventRepository {
 
             // v2: increment reply_count on the target event
             if let Some(ref target_id) = reply_target_id {
-                sqlx::query("UPDATE events SET reply_count = reply_count + 1 WHERE id = $1")
-                    .bind(target_id)
-                    .execute(&self.pool)
-                    .await?;
+                let target_row: Option<(String,)> = sqlx::query_as(
+                    "UPDATE events SET reply_count = reply_count + 1 WHERE id = $1 RETURNING pubkey",
+                )
+                .bind(target_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+                // ClickHouse dual-write: reply engagement
+                if let Some(ch) = &self.clickhouse {
+                    let target_pubkey = target_row
+                        .map(|(pk,)| pk)
+                        .unwrap_or_default();
+                    ch.insert_engagement(&ChEngagement {
+                        event_id: event.id.clone(),
+                        kind: 1, // reply
+                        target_id: target_id.clone(),
+                        target_pubkey,
+                        source_pubkey: event.pubkey.clone(),
+                        created_at: event.created_at,
+                    })
+                    .await;
+                }
             }
         }
 
@@ -757,13 +882,26 @@ impl EventRepository {
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&event.id)
-        .bind(sender_pubkey)
-        .bind(recipient_pubkey)
+        .bind(&sender_pubkey)
+        .bind(&recipient_pubkey)
         .bind(amount_msats)
-        .bind(zapped_event_id)
+        .bind(&zapped_event_id)
         .bind(event.created_at)
         .execute(&self.pool)
         .await?;
+
+        // ClickHouse dual-write: zap metadata
+        if let Some(ch) = &self.clickhouse {
+            ch.insert_zap(&ChZapMetadata {
+                event_id: event.id.clone(),
+                sender_pubkey: sender_pubkey.unwrap_or_default(),
+                recipient_pubkey: recipient_pubkey.unwrap_or_default(),
+                amount_msats,
+                zapped_event_id: zapped_event_id.unwrap_or_default(),
+                created_at: event.created_at,
+            })
+            .await;
+        }
 
         Ok(())
     }
@@ -907,6 +1045,24 @@ impl EventRepository {
         .await?;
 
         Ok(event)
+    }
+
+    /// Fetch multiple events by ID in a single query.
+    /// Used by ClickHouse two-phase queries: ClickHouse returns IDs, then we fetch full events from Postgres.
+    pub async fn get_events_by_ids(&self, ids: &[String]) -> Result<Vec<StoredEvent>, AppError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let events = sqlx::query_as::<_, StoredEvent>(
+            "SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+             FROM events WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(events)
     }
 
     /// Query events with optional filters.
@@ -3385,4 +3541,13 @@ enum BindValue {
 
 fn is_hex_pubkey(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extract the client tag value from event tags (e.g. ["client", "Damus"]).
+fn extract_client_tag(tags: &[Vec<String>]) -> String {
+    tags.iter()
+        .find(|t| t.len() >= 2 && t[0] == "client")
+        .and_then(|t| t.get(1).filter(|s| !s.is_empty()))
+        .cloned()
+        .unwrap_or_default()
 }

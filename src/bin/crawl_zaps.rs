@@ -157,6 +157,7 @@ async fn build_syncer(pool: &sqlx::PgPool) -> NegentropySyncer {
         follower_cache,
         wot_cache,
         block_cache,
+        None,
     );
     let cache = StatsCache::new(redis_client, repo.clone());
     NegentropySyncer::new(repo, cache, pool.clone())

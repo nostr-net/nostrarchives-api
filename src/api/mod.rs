@@ -12,6 +12,7 @@ use crate::auth::ReplayGuard;
 use crate::block_cache::BlockCache;
 use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
+use crate::db::clickhouse::ClickHouseAnalytics;
 use crate::db::repository::EventRepository;
 use crate::live_metrics::LiveMetricsTracker;
 use crate::profile_search_cache::ProfileSearchCache;
@@ -30,6 +31,7 @@ pub struct AppState {
     pub block_cache: BlockCache,
     pub admin_pubkey: Option<String>,
     pub replay_guard: ReplayGuard,
+    pub clickhouse: Option<Arc<ClickHouseAnalytics>>,
 }
 
 async fn cache_control_middleware(

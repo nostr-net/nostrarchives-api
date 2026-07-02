@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use bech32::{self, FromBase32};
+use bech32;
 use chrono::Utc;
 use hex;
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,7 @@ pub async fn get_profiles_metadata(
     let mut sorted_for_hash = ordered_pubkeys.clone();
     sorted_for_hash.sort();
     let sorted_joined = sorted_for_hash.join(",");
-    let hash = format!("{:x}", Sha256::digest(sorted_joined.as_bytes()));
+    let hash = hex::encode(Sha256::digest(sorted_joined.as_bytes()));
     let cache_key = format!("profiles:metadata:{hash}");
 
     if let Some(cached) = state.cache.get_json(&cache_key).await {
@@ -313,47 +313,77 @@ pub async fn get_top_notes_unified(
         }
     };
 
-    let (ranked, profile_rows) = state
-        .repo
-        .top_notes_unified(ref_type, since, limit, offset)
-        .await?;
+    let response = if let Some(ch) = &state.clickhouse {
+        // ClickHouse path: get ranked IDs, then fetch full events from Postgres
+        let ch_rows = ch.top_notes_by_metric(ref_type, since, limit * 4, offset).await?;
+        let event_ids: Vec<String> = ch_rows.iter().map(|r| r.event_id.clone()).collect();
+        let events = state.repo.get_events_by_ids(&event_ids).await?;
 
-    let profiles: HashMap<String, Value> = profile_rows
-        .into_iter()
-        .filter_map(|row| {
-            serde_json::from_str::<Value>(&row.content).ok().map(|v| {
-                let entry = json!({
-                    "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
-                    "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
-                    "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
-                    "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
-                });
-                (row.pubkey.clone(), entry)
+        // Build event lookup map
+        let event_map: HashMap<String, _> = events.into_iter().map(|e| (e.id.clone(), e)).collect();
+
+        // WoT filter
+        let all_pubkeys: Vec<String> = ch_rows.iter()
+            .filter_map(|r| event_map.get(&r.event_id).map(|e| e.pubkey.clone()))
+            .collect();
+        let passing = state.repo.wot_cache.retain_passing(&all_pubkeys).await;
+
+        let is_zap = ref_type == "zap";
+        let mut pubkeys = Vec::new();
+        let notes: Vec<Value> = ch_rows
+            .iter()
+            .filter_map(|r| event_map.get(&r.event_id))
+            .filter(|e| passing.contains(&e.pubkey))
+            .take(limit as usize)
+            .map(|e| {
+                pubkeys.push(e.pubkey.clone());
+                let ch = ch_rows.iter().find(|r| r.event_id == e.id).unwrap();
+                json!({
+                    "count": ch.metric_count,
+                    "total_sats": if is_zap { Some(ch.zap_sats) } else { None },
+                    "reactions": ch.reactions,
+                    "replies": ch.replies,
+                    "reposts": ch.reposts,
+                    "zap_sats": ch.zap_sats,
+                    "event": e,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    let notes: Vec<Value> = ranked
-        .into_iter()
-        .map(|entry| {
-            json!({
-                "count": entry.count,
-                "total_sats": entry.total_sats,
-                "reactions": entry.reactions,
-                "replies": entry.replies,
-                "reposts": entry.reposts,
-                "zap_sats": entry.zap_sats,
-                "event": entry.event,
+        let unique_pubkeys: Vec<String> = {
+            let mut seen = HashSet::new();
+            pubkeys.into_iter().filter(|pk| seen.insert(pk.clone())).collect()
+        };
+        let profile_rows = state.repo.latest_profile_metadata(&unique_pubkeys).await?;
+        let profiles = build_profiles_map(profile_rows);
+
+        json!({ "metric": metric, "range": range, "notes": notes, "profiles": profiles })
+    } else {
+        // Postgres fallback
+        let (ranked, profile_rows) = state
+            .repo
+            .top_notes_unified(ref_type, since, limit, offset)
+            .await?;
+
+        let profiles = build_profiles_map(profile_rows);
+
+        let notes: Vec<Value> = ranked
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "count": entry.count,
+                    "total_sats": entry.total_sats,
+                    "reactions": entry.reactions,
+                    "replies": entry.replies,
+                    "reposts": entry.reposts,
+                    "zap_sats": entry.zap_sats,
+                    "event": entry.event,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    let response = json!({
-        "metric": metric,
-        "range": range,
-        "notes": notes,
-        "profiles": profiles,
-    });
+        json!({ "metric": metric, "range": range, "notes": notes, "profiles": profiles })
+    };
 
     // ── Write to Redis cache ───────────────────────────────────────
     if let Ok(json_str) = serde_json::to_string(&response) {
@@ -381,7 +411,34 @@ pub async fn get_trending_notes(
         }
     }
 
-    let notes = state.repo.trending_notes(limit, offset).await?;
+    let notes = if let Some(ch) = &state.clickhouse {
+        let ch_rows = ch.trending_note_ids(limit * 4, offset).await?;
+        let event_ids: Vec<String> = ch_rows.iter().map(|r| r.event_id.clone()).collect();
+        let events = state.repo.get_events_by_ids(&event_ids).await?;
+        let event_map: HashMap<String, _> = events.into_iter().map(|e| (e.id.clone(), e)).collect();
+
+        let all_pubkeys: Vec<String> = ch_rows.iter()
+            .filter_map(|r| event_map.get(&r.event_id).map(|e| e.pubkey.clone()))
+            .collect();
+        let passing = state.repo.wot_cache.retain_passing(&all_pubkeys).await;
+
+        ch_rows.iter()
+            .filter_map(|r| {
+                event_map.get(&r.event_id).map(|e| crate::db::models::TrendingNote {
+                    event: e.clone(),
+                    score: r.score,
+                    zap_sats: r.zap_sats,
+                    reposts: r.reposts,
+                    replies: r.replies,
+                    reactions: r.reactions,
+                })
+            })
+            .filter(|n| passing.contains(&n.event.pubkey))
+            .take(limit as usize)
+            .collect::<Vec<_>>()
+    } else {
+        state.repo.trending_notes(limit, offset).await?
+    };
     let response = json!({ "notes": notes });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
@@ -406,7 +463,11 @@ pub async fn get_new_users(
         }
     }
 
-    let users = state.repo.new_users(limit, offset).await?;
+    let users = if let Some(ch) = &state.clickhouse {
+        ch.new_user_ids(limit, offset).await?
+    } else {
+        state.repo.new_users(limit, offset).await?
+    };
     let response = json!({ "users": users });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
@@ -431,7 +492,11 @@ pub async fn get_trending_users(
         }
     }
 
-    let users = state.repo.trending_users(limit, offset).await?;
+    let users = if let Some(ch) = &state.clickhouse {
+        ch.trending_user_ids(limit, offset).await?
+    } else {
+        state.repo.trending_users(limit, offset).await?
+    };
     let response = json!({ "users": users });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
@@ -463,7 +528,11 @@ pub async fn get_top_zappers(
         }
     }
 
-    let zappers = state.repo.top_zappers(direction, range, limit, offset).await?;
+    let zappers = if let Some(ch) = &state.clickhouse {
+        ch.top_zappers(direction, range, limit, offset).await?
+    } else {
+        state.repo.top_zappers(direction, range, limit, offset).await?
+    };
     let response = json!({
         "direction": direction,
         "range": range,
@@ -501,7 +570,11 @@ pub async fn get_top_posters(
         }
     }
 
-    let authors = state.repo.top_posters(range, limit, offset).await?;
+    let authors = if let Some(ch) = &state.clickhouse {
+        ch.top_posters(range, limit, offset).await?
+    } else {
+        state.repo.top_posters(range, limit, offset).await?
+    };
     let response = json!({
         "range": range,
         "authors": authors,
@@ -537,7 +610,11 @@ pub async fn get_most_liked_authors(
         }
     }
 
-    let authors = state.repo.most_liked_authors(range, limit, offset).await?;
+    let authors = if let Some(ch) = &state.clickhouse {
+        ch.most_liked_authors(range, limit, offset).await?
+    } else {
+        state.repo.most_liked_authors(range, limit, offset).await?
+    };
     let response = json!({
         "range": range,
         "authors": authors,
@@ -573,7 +650,11 @@ pub async fn get_most_shared_authors(
         }
     }
 
-    let authors = state.repo.most_shared_authors(range, limit, offset).await?;
+    let authors = if let Some(ch) = &state.clickhouse {
+        ch.most_shared_authors(range, limit, offset).await?
+    } else {
+        state.repo.most_shared_authors(range, limit, offset).await?
+    };
     let response = json!({
         "range": range,
         "authors": authors,
@@ -607,7 +688,9 @@ pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value
         }
     }
 
-    let stats = if let Some((dau, daily_posts)) = state.cache.get_daily_dau_posts().await {
+    let stats = if let Some(ch) = &state.clickhouse {
+        ch.daily_stats().await?
+    } else if let Some((dau, daily_posts)) = state.cache.get_daily_dau_posts().await {
         // Fast path: DAU + posts from Redis, only zap sats from DB (indexed, ~5ms).
         let total_sats = state.repo.daily_zap_sats().await.unwrap_or(0);
         crate::db::models::DailyStats {
@@ -1400,7 +1483,11 @@ pub async fn get_trending_hashtags(
         }
     }
 
-    let hashtags = state.repo.trending_hashtags(limit, offset).await?;
+    let hashtags = if let Some(ch) = &state.clickhouse {
+        ch.trending_hashtags(limit, offset).await?
+    } else {
+        state.repo.trending_hashtags(limit, offset).await?
+    };
     let response = json!({
         "hashtags": hashtags,
     });
@@ -1492,7 +1579,11 @@ pub async fn get_client_leaderboard(
         }
     }
 
-    let clients = state.repo.client_leaderboard(range, limit, offset).await?;
+    let clients = if let Some(ch) = &state.clickhouse {
+        ch.client_leaderboard(range, limit, offset).await?
+    } else {
+        state.repo.client_leaderboard(range, limit, offset).await?
+    };
     let response = json!({
         "range": range,
         "clients": clients,
@@ -1532,7 +1623,11 @@ pub async fn get_client_users(
         }
     }
 
-    let users = state.repo.client_users(&name, limit, offset).await?;
+    let users = if let Some(ch) = &state.clickhouse {
+        ch.client_users(&name, limit, offset).await?
+    } else {
+        state.repo.client_users(&name, limit, offset).await?
+    };
 
     // Bulk-fetch profile metadata for all pubkeys
     let pubkeys: Vec<String> = users.iter().map(|u| u.pubkey.clone()).collect();
@@ -1566,7 +1661,11 @@ pub async fn get_relay_leaderboard(
         }
     }
 
-    let relays = state.repo.relay_leaderboard(limit, offset).await?;
+    let relays = if let Some(ch) = &state.clickhouse {
+        ch.relay_leaderboard(limit, offset).await?
+    } else {
+        state.repo.relay_leaderboard(limit, offset).await?
+    };
     let response = json!({ "relays": relays });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
@@ -1606,7 +1705,11 @@ pub async fn get_analytics_daily(
     let today = Utc::now().date_naive();
     let since = today - chrono::Duration::days(days);
 
-    let data = state.repo.get_daily_analytics(since, today).await?;
+    let data = if let Some(ch) = &state.clickhouse {
+        ch.daily_analytics(since, today).await?
+    } else {
+        state.repo.get_daily_analytics(since, today).await?
+    };
 
     let response = json!({
         "data": data,
@@ -1624,14 +1727,12 @@ pub async fn get_analytics_daily(
 }
 
 fn decode_npub(npub: &str) -> Result<String, AppError> {
-    let (hrp, data, _) =
+    let (hrp, bytes) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
-    if hrp != "npub" {
+    if hrp.as_str() != "npub" {
         return Err(AppError::BadRequest(format!("invalid npub: {npub}")));
     }
 
-    let bytes = Vec::<u8>::from_base32(&data)
-        .map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
     if bytes.len() != 32 {
         return Err(AppError::BadRequest(format!("invalid npub: {npub}")));
     }

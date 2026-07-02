@@ -1,7 +1,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use base64::Engine;
-use secp256k1::{Message, XOnlyPublicKey, SECP256K1};
+use secp256k1::{XOnlyPublicKey, SECP256K1};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -183,8 +183,6 @@ fn verify_event_signature(event: &Nip98Event) -> Result<(), AppError> {
     ]);
 
     let hash = Sha256::digest(serialized.to_string().as_bytes());
-    let msg = Message::from_digest_slice(&hash)
-        .map_err(|e| AppError::Unauthorized(format!("invalid message hash: {e}")))?;
 
     let sig = secp256k1::schnorr::Signature::from_str(&event.sig)
         .map_err(|e| AppError::Unauthorized(format!("invalid signature format: {e}")))?;
@@ -193,7 +191,7 @@ fn verify_event_signature(event: &Nip98Event) -> Result<(), AppError> {
         .map_err(|e| AppError::Unauthorized(format!("invalid pubkey: {e}")))?;
 
     SECP256K1
-        .verify_schnorr(&sig, &msg, &pk)
+        .verify_schnorr(&sig, hash.as_slice(), &pk)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))?;
 
     Ok(())

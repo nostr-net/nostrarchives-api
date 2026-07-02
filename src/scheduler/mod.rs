@@ -971,20 +971,28 @@ fn verify_signature(event_id: &str, pubkey: &str, sig: &str) -> Result<(), Strin
 
     let msg_bytes =
         hex::decode(event_id).map_err(|_| "invalid: event id is not valid hex".to_string())?;
-    let msg = secp256k1::Message::from_digest_slice(&msg_bytes)
-        .map_err(|_| "invalid: event id is not a valid 32-byte hash".to_string())?;
+    if msg_bytes.len() != 32 {
+        return Err("invalid: event id is not a valid 32-byte hash".to_string());
+    }
 
     let pk_bytes =
         hex::decode(pubkey).map_err(|_| "invalid: pubkey is not valid hex".to_string())?;
-    let xonly = XOnlyPublicKey::from_slice(&pk_bytes)
+    let pk_array: [u8; 32] = pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid: pubkey is not a valid x-only public key".to_string())?;
+    let xonly = XOnlyPublicKey::from_byte_array(pk_array)
         .map_err(|_| "invalid: pubkey is not a valid x-only public key".to_string())?;
 
     let sig_bytes =
         hex::decode(sig).map_err(|_| "invalid: signature is not valid hex".to_string())?;
-    let schnorr_sig = secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+    let sig_array: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
         .map_err(|_| "invalid: signature is not a valid Schnorr signature".to_string())?;
+    let schnorr_sig = secp256k1::schnorr::Signature::from_byte_array(sig_array);
 
-    secp.verify_schnorr(&schnorr_sig, &msg, &xonly)
+    secp.verify_schnorr(&schnorr_sig, &msg_bytes, &xonly)
         .map_err(|_| "invalid: signature verification failed".to_string())?;
 
     Ok(())

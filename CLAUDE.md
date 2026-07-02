@@ -59,13 +59,23 @@ On startup, `main.rs` spins up several concurrent subsystems, all sharing `Arc`-
 
 8. **Background tasks** (inline in `main.rs`):
    - `profile_search` materialized view refresh every 5 minutes
-   - Analytics materialized views refresh every 30 minutes
-   - Daily analytics computation at midnight UTC (backfills last 30 days on startup)
+   - Analytics materialized views refresh every 30 minutes (disabled when ClickHouse is enabled)
+   - Daily analytics computation at midnight UTC (disabled when ClickHouse is enabled)
+
+### ClickHouse Analytics (Optional)
+
+When `CLICKHOUSE_URL` is set, analytics/aggregation queries use ClickHouse instead of Postgres materialized views. This is a dual-write architecture:
+
+- **Ingestion**: `EventRepository::insert_event()` writes to both Postgres and ClickHouse. ClickHouse writes are fire-and-forget (errors logged, never block ingestion).
+- **Analytics reads**: 14 handler endpoints check `state.clickhouse` first; if present, query ClickHouse for aggregation, then fetch full event data from Postgres by ID. Falls back to Postgres MVs if ClickHouse is unavailable.
+- **ClickHouse tables** (`src/db/clickhouse.rs`): `events` (MergeTree), `engagement` (reactions/reposts/replies as individual rows), `zap_metadata`, `note_hashtags`, `follows` (ReplacingMergeTree), `relay_lists` (ReplacingMergeTree). No content/tags/raw columns — only aggregation-relevant fields.
+- **What stays in Postgres**: event storage, point lookups, FTS, social graph, profile search, thread traversal, mutable state (crawl_state, scheduled_events, etc.).
+- **Backfill**: `cargo run --bin backfill_clickhouse` streams existing Postgres data into ClickHouse tables in 50k-row batches.
 
 ### Shared State
 
 `AppState` (defined in `src/api/mod.rs`) wraps:
-- `EventRepository` — all DB access; holds `PgPool`, `FollowerCache`, and `WotCache`
+- `EventRepository` — all DB access; holds `PgPool`, `FollowerCache`, `WotCache`, and optional `ClickHouseAnalytics`
 - `StatsCache` — Redis-backed counters and JSON response caching
 - `CrawlQueue` — crawler work queue (optional, `None` when crawler disabled)
 - `RelayFetcher` — on-demand fetcher for missing events/profiles
@@ -109,6 +119,7 @@ Migrations in `migrations/` run automatically via sqlx on startup (`db::init_poo
 
 - `axum 0.8` with `ws` feature — HTTP + WebSocket server
 - `sqlx 0.8` — async PostgreSQL (compile-time checked queries)
+- `clickhouse 0.15` — async ClickHouse client for analytics (optional)
 - `tokio-tungstenite` — outbound WebSocket relay connections
 - `negentropy 0.5` — set reconciliation protocol crate
 - `secp256k1` — event signature verification
@@ -123,3 +134,4 @@ Copy `.env.example` to `.env` before first run. The most impactful non-default s
 - `CRAWLER_USE_RELAY_LISTS=true` — routes crawl requests to each author's own write relays
 - `WOT_THRESHOLD` — lower values ingest more content; higher values are more selective
 - `ONDEMAND_FETCH_ENABLED=true` — fetches missing events from relays on API miss
+- `CLICKHOUSE_URL=http://localhost:8123` — enables ClickHouse analytics engine (optional, graceful fallback to Postgres)

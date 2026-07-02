@@ -1264,10 +1264,8 @@ fn build_kind_30015(
     let id_hex = hex::encode(&id_bytes);
 
     // Sign with Schnorr
-    let msg = secp256k1::Message::from_digest_slice(&id_bytes)
-        .expect("32-byte hash is always valid");
-    let sig = secp.sign_schnorr_no_aux_rand(&msg, keypair);
-    let sig_hex = hex::encode(sig.serialize());
+    let sig = secp.sign_schnorr_no_aux_rand(id_bytes.as_slice(), keypair);
+    let sig_hex = hex::encode(sig.to_byte_array());
 
     serde_json::json!({
         "id": id_hex,

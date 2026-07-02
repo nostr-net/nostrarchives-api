@@ -1,3 +1,5 @@
+pub mod clickhouse;
+pub mod clickhouse_models;
 pub mod models;
 pub mod repository;
 

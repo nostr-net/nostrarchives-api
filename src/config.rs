@@ -4,6 +4,7 @@ use std::env;
 pub struct Config {
     pub database_url: String,
     pub redis_url: String,
+    pub clickhouse_url: Option<String>,
     pub relay_urls: Vec<String>,
     pub listen_addr: String,
     pub ingestion_since: Option<i64>,
@@ -59,6 +60,8 @@ impl Config {
             .unwrap_or_else(|_| "postgres://dev:dev@localhost:5432/nostr_api".into());
 
         let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+
+        let clickhouse_url = env::var("CLICKHOUSE_URL").ok().filter(|s| !s.is_empty());
 
         let relay_urls: Vec<String> = env::var("RELAY_URLS")
             .unwrap_or_else(|_| {
@@ -283,6 +286,7 @@ impl Config {
         Self {
             database_url,
             redis_url,
+            clickhouse_url,
             relay_urls,
             listen_addr,
             ingestion_since,
